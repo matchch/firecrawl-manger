@@ -1,5 +1,31 @@
 # Firecrawl API Manager (FCAM)
 
+## 自用安全补丁镜像（linux/amd64）
+
+```text
+ghcr.io/matchch/firecrawl-manger:authfix-1.0.0
+```
+
+仅替换现有容器的 image；原端口（容器内 8000）、环境变量、配置文件与 `/app/data` 数据卷不变。
+务必保留原 `FCAM_MASTER_KEY`，更新前备份数据。镜像初次发布默认为 GHCR 私有包，
+需在 [包设置](https://github.com/users/matchch/packages/container/firecrawl-manger/settings) 确认 Public 后才能匿名拉取。
+本补丁不会自动恢复历史 disabled Key；须核验真实状态后手动启用。
+
+修复已用本地 MockTransport + SQLite 复现的误禁用机制，并非声称已取得线上原始 403 根因：
+Firecrawl 普通转发、绑定资源请求、Key 测试及余额刷新，仅对明确无效凭据/账号封禁停用；
+其他 401/403（含 HTML 网关页）复用现有 `failed_cooldown_seconds` 冷却，期满自动可选。
+余额响应缺字段/非数字不再用零覆盖健康缓存；429/5xx、UI、数据库结构和 Exa 行为不变。
+
+判定依据为 [Firecrawl auth.ts](https://github.com/firecrawl/firecrawl/blob/7d8e92dc5d270b1247d60e809c3fd32f52e0e47b/apps/api/src/controllers/auth.ts)
+与 [实际 JSON 信封](https://github.com/firecrawl/firecrawl/blob/7d8e92dc5d270b1247d60e809c3fd32f52e0e47b/apps/api/src/routes/shared.ts)：
+只接受 JSON `success: false` 加状态匹配的精确 `error` 文案，不扫描正文，不采用内部日志 reason 充当响应 code。
+
+验证：`pytest tests/unit tests/integration -o addopts='' -q -W 'ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning'`。
+仅忽略上游 Starlette 使用 AnyIO 弃用别名的已存在告警；测试不调用真实上游。
+GitHub Actions 在发布前启动实际容器（禁网），检查入口、迁移、health/ready/UI 及修复代码。
+
+以下为上游原说明（其中 Docker Hub 镜像不包含本补丁）：
+
 [![CI](https://github.com/ZeroPointSix/firecrawl-manger/actions/workflows/ci.yml/badge.svg)](https://github.com/ZeroPointSix/firecrawl-manger/actions/workflows/ci.yml)
 [![Docker Image](https://img.shields.io/docker/v/guangshanshui/firecrawl-manager?label=docker&logo=docker)](https://hub.docker.com/r/guangshanshui/firecrawl-manager)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

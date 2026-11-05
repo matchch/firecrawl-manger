@@ -16,9 +16,10 @@ from sqlalchemy.orm import Session
 from app.config import AppConfig, Secrets
 from app.core.concurrency import ConcurrencyManager
 from app.core.cooldown import NoopCooldownStore
-from app.core.key_pool import KeyPool
+from app.core.key_pool import KeyPool, _cooldown_remaining_seconds
 from app.core.rate_limit import TokenBucketRateLimiter
 from app.core.security import decrypt_api_key, derive_master_key_bytes
+from app.core.upstream_auth import is_permanent_auth_failure
 from app.db.models import ApiKey, Client
 from app.errors import FcamError
 from app.observability.metrics import Metrics
@@ -279,6 +280,10 @@ class Forwarder:
                     # Provider mismatch: pinned key belongs to a different provider
                     pinned_api_key_id = None
                 else:
+                    cooldown = _cooldown_remaining_seconds(pinned_key, datetime.now(timezone.utc))
+                    if pinned_key.status in {"cooling", "failed"} and cooldown > 0:
+                        raise FcamError(status_code=503, code="ALL_KEYS_COOLING",
+                                        message="Bound resource key is cooling", retry_after=cooldown)
                     last_api_key_id = pinned_key.id
                     if self._metrics is not None:
                         self._metrics.record_key_selected(pinned_key.id)
@@ -414,7 +419,7 @@ class Forwarder:
                             )
 
                         if resp.status_code in {401, 403}:
-                            self._disable_key(db, pinned_key, resp.status_code)
+                            self._handle_auth_failure(db, pinned_key, resp)
                             return ForwardResult(
                                 response=_to_fastapi_response(resp),
                                 upstream_status_code=last_upstream_status,
@@ -621,7 +626,7 @@ class Forwarder:
                     continue
 
                 if resp.status_code in {401, 403}:
-                    self._disable_key(db, key, resp.status_code)
+                    self._handle_auth_failure(db, key, resp)
                     retry_count += 1
                     if upstream_attempts >= total_attempts:
                         return ForwardResult(
@@ -883,7 +888,7 @@ class Forwarder:
             )
 
         if resp.status_code in {401, 403}:
-            self._disable_key(db, key, resp.status_code)
+            self._handle_auth_failure(db, key, resp)
             logger.info(
                 "upstream.key_test_unauthorized",
                 extra={
@@ -1013,7 +1018,7 @@ class Forwarder:
             self._mark_cooling(db, key, cooldown)
 
         if resp.status_code in {401, 403}:
-            self._disable_key(db, key, resp.status_code)
+            self._handle_auth_failure(db, key, resp)
 
         if resp.status_code >= 500:
             self._record_failure(db, key, reason="upstream_5xx")
@@ -1095,7 +1100,11 @@ class Forwarder:
             db.rollback()
             logger.exception("db.key_cooling_update_failed", extra={"fields": {"api_key_id": key.id}})
 
-    def _disable_key(self, db: Session, key: ApiKey, status_code: int) -> None:
+    def _handle_auth_failure(self, db: Session, key: ApiKey, response: httpx.Response) -> None:
+        if key.provider == "firecrawl" and not is_permanent_auth_failure(response):
+            self._mark_cooling(db, key, max(self._config.firecrawl.failed_cooldown_seconds, 1))
+            return
+        status_code = response.status_code
         try:
             key.status = "disabled"
             key.is_active = False

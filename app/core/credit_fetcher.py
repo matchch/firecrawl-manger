@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from cryptography.exceptions import InvalidTag
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.config import AppConfig
 from app.core.security import decrypt_api_key
+from app.core.upstream_auth import is_permanent_auth_failure
 from app.db.models import ApiKey, CreditSnapshot
 from app.errors import FcamError
 
@@ -110,13 +111,20 @@ async def fetch_credit_from_firecrawl(
                 db.rollback()
             raise FcamError(status_code=502, code="UPSTREAM_ERROR", message="Invalid upstream JSON") from exc
 
-        if not payload.get("success"):
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("success") is not True
+            or not isinstance(data, dict)
+            or any(type(data.get(field)) is not int or data[field] < 0
+                   for field in ("remainingCredits", "planCredits"))
+        ):
             snapshot = CreditSnapshot(
                 api_key_id=key.id,
                 remaining_credits=0,
                 plan_credits=0,
                 fetch_success=False,
-                error_message=str(payload.get("error") or "Upstream returned success=false"),
+                error_message="Invalid credit usage response",
             )
             try:
                 db.add(snapshot)
@@ -125,9 +133,8 @@ async def fetch_credit_from_firecrawl(
                 db.rollback()
             raise FcamError(status_code=502, code="UPSTREAM_ERROR", message="Firecrawl credit usage failed")
 
-        data = payload.get("data") or {}
-        remaining = int(data.get("remainingCredits") or 0)
-        plan = int(data.get("planCredits") or 0)
+        remaining = data["remainingCredits"]
+        plan = data["planCredits"]
 
         snapshot = CreditSnapshot(
             api_key_id=key.id,
@@ -167,8 +174,13 @@ async def fetch_credit_from_firecrawl(
             raise FcamError(status_code=503, code="DB_UNAVAILABLE", message="Database unavailable") from exc
 
     if response.status_code in {401, 403}:
-        key.status = "failed"
-        key.is_active = False
+        permanent = is_permanent_auth_failure(response)
+        if permanent:
+            key.status = "failed"
+            key.is_active = False
+        elif key.is_active and key.status != "disabled":
+            key.status = "cooling"
+            key.cooldown_until = now + timedelta(seconds=max(config.firecrawl.failed_cooldown_seconds, 1))
         snapshot = CreditSnapshot(
             api_key_id=key.id,
             remaining_credits=0,
@@ -183,8 +195,8 @@ async def fetch_credit_from_firecrawl(
             db.rollback()
         raise FcamError(
             status_code=int(response.status_code),
-            code="INVALID_API_KEY",
-            message="API key is invalid or unauthorized",
+            code="INVALID_API_KEY" if permanent else "UPSTREAM_ERROR",
+            message="API key is invalid or unauthorized" if permanent else "Unconfirmed upstream authentication failure",
         )
 
     if response.status_code == 429:

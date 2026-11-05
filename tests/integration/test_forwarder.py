@@ -125,7 +125,7 @@ def test_forwarder_disables_key_on_401_then_uses_next(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         auth = request.headers.get("authorization")
         if auth == "Bearer fc-key-1":
-            return httpx.Response(401, json={"error": "bad key"})
+            return httpx.Response(401, json={"success": False, "error": "Unauthorized: Invalid token"})
         return httpx.Response(200, json={"ok": True})
 
     fwd = Forwarder(

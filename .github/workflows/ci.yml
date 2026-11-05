@@ -1,115 +1,108 @@
-name: CI
+name: Patch image
 
 on:
-  push:
-    branches: [ master ]
-    tags:
-      - 'v*.*.*'
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
+  push:
+    branches: [master]
+    tags: ['authfix-*']
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: patch-image-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  lint:
-    name: 代码检查
+  verify:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
-
-    - name: 设置 Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: 'pip'
-
-    - name: 安装依赖
-      run: |
-        python -m pip install --upgrade pip
-        pip install ruff
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-
-    - name: 使用 Ruff 进行代码检查
-      run: |
-        ruff check app/ tests/ --output-format=github
-
-  test:
-    name: 测试（含集成）
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Offline tests and lint
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+          ruff check app tests
+          # Upstream Starlette 0.52.1 uses an alias deprecated by current AnyIO.
+          pytest tests/unit tests/integration -o addopts='' -q -W 'ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning' --junitxml=test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-test-results
+          path: test-results.xml
+  publish:
+    needs: verify
+    if: github.repository == 'matchch/firecrawl-manger' && startsWith(github.ref, 'refs/tags/authfix-')
     runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: 设置 Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: 'pip'
-
-    - name: 安装依赖
-      run: |
-        python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-
-    - name: 运行测试
-      run: |
-        pytest --cov=app --cov-report=xml --cov-report=term --cov-fail-under=80
-
-  docker:
-    name: Docker 构建
-    runs-on: ubuntu-latest
-    needs: [lint, test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-
     steps:
-    - uses: actions/checkout@v4
-
-    - name: 设置 Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: 登录 Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-
-    - name: 登录 GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: 提取 Docker 元数据
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: |
-          guangshanshui/firecrawl-manager
-          ghcr.io/${{ github.repository }}
-        tags: |
-          type=ref,event=branch
-          type=ref,event=tag
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=sha,prefix=sha-
-          type=raw,value=latest,enable={{is_default_branch}}
-
-    - name: 构建并推送 Docker 镜像
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        run: '[[ "$GITHUB_REF_NAME" =~ ^authfix-[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build linux/amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke actual container entrypoint without network
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+        run: |
+          docker run -d --name fcam-smoke --network none \
+            -e FCAM_ADMIN_TOKEN=offline-smoke-admin-not-a-secret \
+            -e FCAM_MASTER_KEY=offline-smoke-master-not-a-secret "$IMAGE"
+          trap 'docker logs fcam-smoke; docker rm -f fcam-smoke' EXIT
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker exec fcam-smoke python -c 'import urllib.request; [urllib.request.urlopen("http://127.0.0.1:8000" + p, timeout=3).read() for p in ("/healthz", "/readyz", "/ui2/")]'; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+          docker exec fcam-smoke python -c 'import httpx; from app.core.upstream_auth import is_permanent_auth_failure as f; assert not f(httpx.Response(403, text="Forbidden")); assert f(httpx.Response(401, json={"success": False, "error": "Unauthorized: Invalid token"})); print("patched image classifier OK")'
+          docker image inspect "$IMAGE" --format '{{json .Config.Cmd}} {{.Os}}/{{.Architecture}}'
+      - name: Publish tested image and inspect registry
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker push "$IMAGE:sha-${GITHUB_SHA}"
+          docker tag "$IMAGE:sha-${GITHUB_SHA}" "$IMAGE:${GITHUB_REF_NAME}"
+          docker push "$IMAGE:${GITHUB_REF_NAME}"
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA}" | tee manifest.txt
+          gh api "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/firecrawl-manger" --jq '{name,visibility,html_url}' | tee package.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-evidence
+          path: |
+            manifest.txt
+            package.json
