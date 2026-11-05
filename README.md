@@ -7,8 +7,10 @@ ghcr.io/matchch/firecrawl-manger:authfix-1.0.0
 ```
 
 仅替换现有容器的 image；原端口（容器内 8000）、环境变量、配置文件与 `/app/data` 数据卷不变。
-务必保留原 `FCAM_MASTER_KEY`，更新前备份数据。镜像初次发布默认为 GHCR 私有包，
-需在 [包设置](https://github.com/users/matchch/packages/container/firecrawl-manger/settings) 确认 Public 后才能匿名拉取。
+务必保留原 `FCAM_MASTER_KEY`，更新前备份数据。镜像已验证可匿名拉取（GHCR Public）。
+固定镜像摘要：`sha256:bf22ff5b052e2854cd2cb189b789bd767ab34adc5a9619c921815b5f2f61aa91`。
+[构建、340 项离线测试与容器启动验证](https://github.com/matchch/firecrawl-manger/actions/runs/42036513000)
+对应源码提交 `b5639b743dd9409acaff81cf41fd9538b568883c`。
 本补丁不会自动恢复历史 disabled Key；须核验真实状态后手动启用。
 
 修复已用本地 MockTransport + SQLite 复现的误禁用机制，并非声称已取得线上原始 403 根因：
